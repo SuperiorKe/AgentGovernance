@@ -4,5 +4,23 @@
   "private": true,
   "workspaces": [
     "packages/*"
+  ],
+  "description": "Governance middleware for AI agents with deterministic policy enforcement and human approval.",
+  "keywords": [
+    "ai",
+    "ai-agents",
+    "agentic-ai",
+    "ai-governance",
+    "ai-safety",
+    "ai-security",
+    "human-in-the-loop",
+    "llm",
+    "nodejs",
+    "express",
+    "react",
+    "sqlite",
+    "socketio",
+    "audit-logging",
+    "policy-engine"
   ]
 }
