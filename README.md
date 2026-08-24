@@ -1,169 +1,252 @@
-# Agent Governance Platform
+# AgentGovernance
 
-A zero-trust human-in-the-loop governance layer for AI agents — every proposed action is intercepted, evaluated against a deterministic rule engine, and either auto-approved, blocked, or routed to a human reviewer in real time.
+Governance middleware for AI agents with deterministic policy enforcement and human approval.
 
----
+## Problem
 
-## The problem
+AI agents can propose actions that should not always execute automatically. A price change, outbound message, record update, or external API call may be valid in one context and unsafe in another. The repository models that problem as an action-level control point: an agent submits a proposed action, the backend evaluates configured policy rules, and the action receives an explicit decision before execution.
 
-Production AI agents (LangChain, AutoGPT, custom orchestrators) increasingly take real-world actions: changing prices, sending emails, executing trades, modifying records. The operating assumption — that an LLM will behave reasonably most of the time — is not a control plane. When something goes wrong, the post-mortem question is always the same: *who approved this, and on what basis?*
+This project is not an agent framework and does not execute agent actions itself. It is a governance layer that sits between an agent and whatever system would perform the action.
 
-This platform answers that question by design. Agents do not act directly. They submit proposed actions to a governance API, which evaluates them against rules an operator wrote, and either lets the action through, blocks it, or escalates to a human via a real-time dashboard. Every decision is audited.
+## Solution
 
-The audience is operators running agents against systems where a bad action has real cost.
+AgentGovernance provides a small API-first governance service:
 
----
+1. Register a human owner and an agent.
+2. Configure per-agent rules for specific `action_type` values.
+3. Submit proposed actions to `POST /api/v1/governance/request`.
+4. Return one of three decisions:
+   - `auto_approved` when a matching rule allows the action.
+   - `blocked` when a matching rule denies the action.
+   - `pending_approval` when a rule requires review or no rule matches.
+5. Store the action, matched rule, status, timestamps, reviewer decision, and optional execution outcome for audit and reporting.
 
-## How it works
+The default behavior is conservative: if no policy rule matches an action, the rule engine returns `require_approval`, which queues the request for human review instead of allowing it silently.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-  Agent[AI Agent<br/>LangChain / AutoGPT] -->|POST proposed action| API[Express API<br/>:3000]
-  API --> Engine[Rule Engine<br/>boolean logic matrix]
-  Engine --> Decision{Match?}
-  Decision -->|auto_approved| OK[200: approved]
-  Decision -->|blocked| Blocked[200: blocked + reason]
-  Decision -->|no match / pending| DB[(SQLite<br/>governance.sqlite)]
-  DB -->|Socket.io push| Dashboard[React Dashboard<br/>:5173]
-  Operator[Human reviewer] -->|approve / reject| Dashboard
-  Dashboard -->|resolve| API
-  API --> Audit[(Audit Log)]
-  Sweeper[Lifecycle Worker<br/>30s tick] --> DB
+  Agent[AI agent or orchestrator] -->|POST /api/v1/governance/request| API[Express API]
+  API --> Engine[Policy rule engine]
+  Engine -->|reads rules| DB[(SQLite via Knex)]
+  Engine --> Decision{Decision}
+  Decision -->|auto_approve| ActionApproved[Store action as auto_approved]
+  Decision -->|block| ActionBlocked[Store action as blocked]
+  Decision -->|require_approval or no matching rule| ActionPending[Store action as pending]
+  ActionPending -->|Socket.io new_approval_request| Dashboard[React dashboard]
+  Reviewer[Human reviewer] -->|approve or reject| Dashboard
+  Dashboard -->|POST /api/v1/approvals/decision| API
+  API --> ApprovalRecord[Store approval decision]
+  ApprovalRecord -->|Socket.io approval_handled| Dashboard
+  ActionApproved --> Outcomes[Optional outcome tracking]
+  ApprovalRecord --> Outcomes
+  Outcomes --> Audit[Audit and performance views]
+  DB --> Audit
 ```
 
-### Core mechanics
+The implementation is a Node.js workspace with two packages:
 
-- **Zero-trust default.** If no rule matches the proposed action, the consequence is `require_approval`. Silence is never consent.
-- **Boolean rule matrices.** Rules parse arbitrary JSON fields from the action payload using comparison operators (`>`, `<`, `=`, `>=`, `<=`). Operators write rules like "block any price change >15%" or "auto-approve refunds under $50."
-- **Real-time HITL dashboard.** Pending actions are pushed to a React dashboard over Socket.io with full contextual reasoning and the original payload. Approve or reject in one click.
-- **Lifecycle sweeps.** A background worker sweeps the SQLite store every 30 seconds, culling expired approvals and reconciling failed outcomes — so the queue cannot silently leak.
-- **Audit log + scorecards.** Every decision is logged with rule match, decision, latency, and outcome. Per-agent scorecards track success rate, acceptance rate, and latency.
+- `packages/api`: Express HTTP server, Socket.io server, Knex-backed SQLite database initialization, REST routes, policy evaluation, and timeout workers.
+- `packages/dashboard`: React/Vite frontend that fetches agents, rules, pending approvals, audit data, and performance metrics from the API; it also listens for Socket.io approval events.
 
----
+The API initializes its SQLite tables at startup in code rather than through migration files. `DB_PATH` can override the SQLite file path; otherwise the API uses `./governance.sqlite` relative to the API process working directory.
 
-## Tech stack
+`docker-compose.yml` defines Postgres and Redis services, but the current API code does not connect to either service. Treat that file as infrastructure scaffolding, not as the active persistence or worker runtime.
 
-| Layer | Choice | Why |
-|-------|--------|-----|
-| Runtime | Node.js 20+ | Async I/O fits the request-routing workload |
-| API | Express | Minimal, well-understood, no framework lock-in |
-| DB | SQLite (via Knex.js) | Zero ops for prototyping; Knex makes the Postgres migration path trivial |
-| Real-time | Socket.io | Operator dashboards must receive pending actions instantly |
-| Frontend | React + Vite | Fast HMR for iterating on operator UX |
-| Monorepo | NPM workspaces | One `npm install` bootstraps both packages |
+## Action Lifecycle
 
-The SQLite + in-process worker stack is a deliberate prototyping choice. Production scale-out swaps SQLite for Postgres and the polling worker for `BullMQ` + Redis — the API and rule engine stay the same.
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant API as Express API
+  participant R as Rule engine
+  participant DB as SQLite
+  participant S as Socket.io
+  participant UI as React dashboard
+  participant H as Human reviewer
 
----
+  A->>API: POST /api/v1/governance/request
+  API->>R: evaluateActionRules(agent_id, action_type, proposed_value)
+  R->>DB: Load rules for agent_id + action_type
+  DB-->>R: Matching candidate rules
+  R-->>API: auto_approve, block, or require_approval
+  API->>DB: Insert action with status and rule_matched_id
 
-## Running locally
+  alt auto_approve
+    API-->>A: decision = auto_approved
+  else block
+    API-->>A: decision = blocked
+  else require approval
+    API->>S: emit new_approval_request
+    S-->>UI: pending action notification
+    API-->>A: decision = pending_approval + timeout_at
+    H->>UI: Approve or reject
+    UI->>API: POST /api/v1/approvals/decision
+    API->>DB: Insert approval and update action status
+    API->>S: emit approval_handled
+  end
 
-Requires **Node.js 20+**.
+  A->>API: POST /api/v1/outcomes/track for approved action
+  API->>DB: Insert success, latency_ms, and notes
+```
 
-### 1. Install
+## Policy Decisions
 
-From the monorepo root:
+Rules are stored in the `rules` table with an `agent_id`, `action_type`, JSON `condition`, and `consequence`. The rule engine loads rules for the submitted agent and action type, evaluates each condition against `proposed_value`, and returns the highest-severity matching consequence.
+
+Supported condition forms:
+
+- Single-field comparison: `{ "field": "change_percentage", "operator": "gt", "threshold": 0.1 }`
+- `AND` arrays for all conditions matching.
+- `OR` arrays for at least one condition matching.
+
+Supported operators are `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, and `contains`. If no rule exists or no condition matches, the engine returns `require_approval` with no matched rule id.
+
+Consequence severity is explicit in the implementation:
+
+1. `auto_approve`
+2. `require_approval`
+3. `block`
+
+That means a blocking rule wins over review or approval when multiple rules match the same action.
+
+## Human Review
+
+Human review is implemented through the approvals API and dashboard:
+
+- Pending actions are available from `GET /api/v1/approvals/pending`.
+- The governance route emits `new_approval_request` through Socket.io when an action is queued.
+- The dashboard fetches pending approvals on load and refreshes when it receives the Socket.io event.
+- Reviewers submit `approved` or `rejected` to `POST /api/v1/approvals/decision`.
+- Rejections require a reason.
+- The API writes an `approvals` row, updates the action to `approved` or `rejected`, sets `resolved_at`, and emits `approval_handled` so dashboards remove the handled item.
+
+There is no full authentication middleware yet. The MVP key-generation routes create users, agents, and API key records, but request authorization is not enforced on protected routes.
+
+## Audit Trail
+
+The database records the key pieces needed to reconstruct a governance decision:
+
+- `actions`: agent id, action type, proposed JSON payload, agent reasoning, matched rule id, status, creation time, resolution time, and approval timeout.
+- `approvals`: approver id, decision, rejection reason when supplied, and decision timestamp.
+- `outcomes`: success flag, latency in milliseconds, notes, and recorded timestamp for approved or auto-approved actions.
+
+`GET /api/v1/audit?agent_id=...` joins actions with approval/user data and returns the recent decision history for an agent. `GET /api/v1/agents/:agent_id/performance` derives all-time action count, success rate, average latency, and user acceptance rate from recorded actions, approvals, and outcomes.
+
+## Testing
+
+There is currently no automated test suite checked into the repository. The API package has a placeholder `npm test` script that exits with an error, while the dashboard package provides build and lint scripts.
+
+Useful checks for the current repository state:
+
+```bash
+cd packages/api
+npx tsc --noEmit
+```
+
+```bash
+cd packages/dashboard
+npm run build
+npm run lint
+```
+
+## Tech Stack
+
+| Area | Implementation present in this repo |
+| --- | --- |
+| Backend | Node.js, TypeScript, Express |
+| Realtime | Socket.io server and Socket.io React client |
+| Database | SQLite through Knex |
+| Frontend | React, Vite, TypeScript |
+| HTTP client | Axios in the dashboard |
+| Identifiers | UUIDs |
+| Local services scaffold | Docker Compose for Postgres and Redis, not wired into the API |
+| Workspace | npm workspaces |
+
+## Running Locally
+
+Prerequisites:
+
+- Node.js 20+ recommended.
+- npm.
+
+Install dependencies from the repository root:
 
 ```bash
 npm install
 ```
 
-This bootstraps both `packages/api` and `packages/dashboard`.
-
-### 2. Start the API
+Start the API:
 
 ```bash
 cd packages/api
 npm run dev
 ```
 
-The backend auto-initialises its SQLite schema in `packages/api/governance.sqlite` on startup and listens on port **3000**.
+The API listens on port `3000` by default. Set `PORT` to override it. Set `DB_PATH` to control where the SQLite database file is written.
 
-### 3. Start the dashboard
-
-In a second terminal:
+Start the dashboard in a second terminal:
 
 ```bash
 cd packages/dashboard
 npm run dev
 ```
 
-Vite serves the dashboard at port **5173**.
+The dashboard is configured to call `http://localhost:3000/api/v1` and connect to Socket.io at `http://localhost:3000`.
 
----
-
-## Using the API
-
-The system exposes RESTful endpoints to register agents and submit actions.
-
-### 1. Bootstrap an owner + agent
+Example bootstrap flow:
 
 ```bash
-# Generate a master user API key
-POST http://localhost:3000/api/v1/auth/keys/user
-
-# Generate an agent key tied to that owner
-POST http://localhost:3000/api/v1/auth/keys/agent
+curl -X POST http://localhost:3000/api/v1/auth/keys/user \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Demo Owner","email":"owner@example.com"}'
 ```
 
-### 2. Submit a proposed action
+Use the returned `userId` as `ownerId`:
 
 ```bash
-POST http://localhost:3000/api/v1/governance/request
-Content-Type: application/json
-
-{
-  "agent_id": "your-agent-id",
-  "action_type": "price_change",
-  "proposed_value": {
-    "item": "Tomatoes",
-    "change_percentage": 0.15
-  },
-  "reasoning": "Matching competitive market hike."
-}
+curl -X POST http://localhost:3000/api/v1/auth/keys/agent \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Pricing Agent","framework":"custom","ownerId":"USER_ID_FROM_PREVIOUS_RESPONSE"}'
 ```
 
-The response is one of:
+Create a policy rule for that agent:
 
-- `auto_approved` — a rule matched and allowed the action
-- `blocked` — a rule matched and refused the action
-- `pending_approval` — no rule matched (or a `require_approval` rule fired); the dashboard receives the request via Socket.io
-
----
-
-## Architecture
-
-```
-agent-governance-platform/
-├── packages/
-│   ├── api/                 # Express + Knex + SQLite + Socket.io
-│   │   ├── governance.sqlite      # auto-created on first run
-│   │   ├── src/
-│   │   │   ├── routes/            # REST endpoints
-│   │   │   ├── engine/            # rule evaluation
-│   │   │   ├── workers/           # lifecycle sweeper
-│   │   │   └── db/                # Knex migrations + queries
-│   │   └── package.json
-│   └── dashboard/           # React + Vite + Socket.io-client + Axios
-│       ├── src/
-│       │   ├── components/
-│       │   ├── hooks/
-│       │   └── App.tsx
-│       └── package.json
-├── docker-compose.yml
-├── package.json             # NPM workspaces root
-└── README.md
+```bash
+curl -X POST http://localhost:3000/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id":"AGENT_ID","action_type":"price_change","condition":{"field":"change_percentage","operator":"gt","threshold":0.1},"consequence":"require_approval"}'
 ```
 
----
+Submit an action for governance:
 
-## Roadmap
+```bash
+curl -X POST http://localhost:3000/api/v1/governance/request \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id":"AGENT_ID","action_type":"price_change","proposed_value":{"item":"tomatoes","change_percentage":0.15},"reasoning":"Supplier costs increased."}'
+```
 
-- **Production auth.** Current endpoints generate keys; bcrypt hashing + revocation for production.
-- **Worker scale-out.** Move the lifecycle sweeper to BullMQ + Redis for higher agent concurrency.
-- **SSO.** OAuth / SAML for team-based operator access.
-- **Postgres adapter.** Knex makes this a config swap; needs migration script + production smoke tests.
+## Engineering Decisions
 
----
+- **Default-to-review policy:** unmatched rules become `require_approval`, which is safer than treating missing configuration as approval.
+- **Severity ordering:** when more than one rule matches, `block` overrides `require_approval`, and `require_approval` overrides `auto_approve`.
+- **Action-level records:** the API stores every proposed action before returning the decision, including blocked and auto-approved decisions, so audit views are not limited to human-reviewed cases.
+- **Simple JSON rule language:** rules operate on JSON fields inside `proposed_value`, making the MVP easy to inspect and extend without embedding an LLM in the decision path.
+- **Realtime approval queue:** Socket.io events notify dashboards about new and handled approvals, while REST endpoints remain the source of truth.
+- **Outcome tracking is separate from approval:** execution results are reported after approved actions through `/outcomes/track`, keeping governance decisions distinct from whether downstream execution succeeded.
+- **Timeout workers are in-process:** pending approvals are marked `timed_out` after their timeout, and approved actions missing an outcome after two hours receive a failed outcome record. This is simple for an MVP but not a distributed worker design.
 
-Built by **Kenn Macharia** — [SuperiaTech](https://superiatech.vercel.app/)
+## Project Status
+
+This is a portfolio/MVP implementation of an AI-agent governance layer. The core backend routes, SQLite schema initialization, deterministic rule evaluation, pending approval flow, Socket.io notifications, dashboard views, audit endpoint, and outcome metrics are present.
+
+Important limitations:
+
+- No automated tests are currently committed.
+- API keys are generated and stored, but route-level authentication/authorization is not enforced.
+- API keys are stored in plaintext in the MVP implementation.
+- SQLite is the active database; Postgres in Docker Compose is not wired into the API.
+- Redis is present in Docker Compose but no queue library or Redis-backed worker is implemented.
+- The dashboard uses hard-coded localhost API URLs and selects the first agent for audit/performance views.
+- There are no database migration files; schema creation happens at API startup.
